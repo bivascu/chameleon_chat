@@ -83,7 +83,13 @@ public class MainChatView extends VerticalLayout implements Broadcaster.Broadcas
         });
 
         add(chatContainer, inputLayout);
-        loadChatHistory();
+        try {
+            loadChatHistory();
+        }catch (Exception e){
+            System.out.println(e.getMessage());
+            VaadinSession.getCurrent().close();
+            UI.getCurrent().getPage().executeJs("window.location.reload();");
+        }
 
         // populate session
         if(Objects.isNull(VaadinSession.getCurrent().getAttribute(KCommand.KGARBLE.name()))){
