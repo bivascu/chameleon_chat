@@ -1,20 +1,42 @@
 package com.oaks.chameleon_chat;
 
+import com.oaks.enums.KCommand;
+import com.oaks.enums.MessageColors;
+import com.oaks.server.*;
 import com.vaadin.flow.component.Key;
+import com.vaadin.flow.component.UI;
 import com.vaadin.flow.component.button.Button;
 import com.vaadin.flow.component.html.Div;
 import com.vaadin.flow.component.orderedlayout.HorizontalLayout;
 import com.vaadin.flow.component.orderedlayout.VerticalLayout;
 import com.vaadin.flow.component.textfield.TextField;
 import com.vaadin.flow.router.Route;
+import com.vaadin.flow.server.VaadinService;
+import com.vaadin.flow.server.VaadinSession;
+import jakarta.annotation.PreDestroy;
+
+import java.util.Arrays;
+import java.util.List;
+import java.util.Objects;
 
 @Route("chat")
-public class MainChatView extends VerticalLayout {
+public class MainChatView extends VerticalLayout implements Broadcaster.BroadcastListener {
 
     HorizontalLayout inputLayout = null;
     VerticalLayout chatContainer = null;
+    private final UI ui;
+    private final String instanceIpAddress;
+    private Long maxIdReceivedMessage = 0L;
+
+    private boolean kgarbleActive = false;
 
     public MainChatView() {
+        this.ui = UI.getCurrent();
+        instanceIpAddress = ServerUtils.resolveIp(VaadinService.getCurrentRequest());
+        System.out.println("instanceIpAddress: " + instanceIpAddress);
+        // Register this view for broadcasts
+        Broadcaster.register(this);
+
         setSizeFull();
         setAlignItems(Alignment.CENTER);
         setJustifyContentMode(JustifyContentMode.CENTER);
@@ -37,23 +59,6 @@ public class MainChatView extends VerticalLayout {
                 //.set("background-color", "#e6e6e6");
                 .set("background-color", "transparent");
 
-//        messageInput.addValueChangeListener(event -> {
-//            System.out.println("Running hide listener");
-//            String value = event.getValue();
-//            if (value.startsWith("k")) {
-//                messageInput.getStyle()
-//                        .set("color", "transparent")
-//                        .set("background-color", "transparent")
-//                        .set("caret-color", "black"); // keep cursor visible
-//            } else {
-//                messageInput.getStyle()
-//                        .remove("color")
-//                        .remove("background-color")
-//                        .remove("caret-color");
-//            }
-//        });
-
-
         Button postButton = new Button("✏️ Post");
         postButton.getStyle()
                 .set("border-radius", "20px")
@@ -70,51 +75,132 @@ public class MainChatView extends VerticalLayout {
 
         // 📤 Add message on click
         postButton.addClickListener(e -> {
-            handleMessageInput(messageInput, chatContainer);
+            handleMessageInput(messageInput);
         });
 
         messageInput.addKeyPressListener(Key.ENTER, keyPressEvent -> {
-            handleMessageInput(messageInput, chatContainer);
+            handleMessageInput(messageInput);
         });
 
         add(chatContainer, inputLayout);
+        loadChatHistory();
+
+        // populate session
+        if(Objects.isNull(VaadinSession.getCurrent().getAttribute(KCommand.KGARBLE.name()))){
+            VaadinSession.getCurrent().setAttribute(KCommand.KGARBLE.name(), false);
+        }
+        if(Objects.isNull(VaadinSession.getCurrent().getAttribute(MessageColors.class.getName()))){
+            VaadinSession.getCurrent().setAttribute(MessageColors.class.getName(),MessageUtils.getNextUnassignedMessageColor());
+        }
     }
 
 
-    private void handleMessageInput(TextField messageInput, VerticalLayout chatContainer) {
+    private void handleMessageInput(TextField messageInput) {
         String msg = messageInput.getValue().trim();
-        boolean isKCommand = KCommands.command(msg, chatContainer);
-        if (!msg.isEmpty() && !isKCommand) {
-            Div bubble = new Div();
-            bubble.setText("Chat Message: " + msg);
-            bubble.getStyle()
-                    .set("background-color", "#007aff") // iOS blue
-                    .set("color", "white")
-                    .set("border-radius", "20px")
-                    .set("padding", "10px 15px")
-                    .set("margin-bottom", "10px")
-                    .set("max-width", "300px")
-                    .set("white-space", "pre-line") // allow line breaks
-                    .set("box-shadow", "0 2px 6px rgba(0,0,0,0.1)")
-                    .set("align-self", "flex-end"); // optional: align right
 
-
-            boolean isSentByUser = false;
-
-            HorizontalLayout wrapper = new HorizontalLayout(bubble);
-            wrapper.setWidthFull();
-            wrapper.setJustifyContentMode(
-                    isSentByUser ? JustifyContentMode.END : JustifyContentMode.START
-            );
-
-
-            chatContainer.add(wrapper);
+        if(isKCommand(msg)) {
+            KCommand command = KCommand.valueOf(msg.toUpperCase());
+            switch(command){
+                case KEJECT -> processKeject();
+                case KHIDE -> processKHide();
+                case KGARBLE -> processKGarble();
+            }
+        }else{
+            OneMessage localMessage = new OneMessage(instanceIpAddress, msg, (MessageColors) VaadinSession.getCurrent().getAttribute(MessageColors.class.getName()));
+            ChatServer.postMessage(localMessage);
+            Broadcaster.broadcast(localMessage);
         }
         messageInput.clear();
-        chatContainer.getElement().executeJs(
-                "const el = this; el.scrollTop = el.scrollHeight;"
-        );
     }
 
+    @Override
+    public void receiveBroadcast(OneMessage message) {
+        if (ui != null && ui.isAttached()) {
+            ui.access(() -> {
+                if (!message.getMessage().isEmpty()
+                        //&& !isKCommand
+                ) {
+                Div bubble = MessageUtils.createDivForMessage(message);
+                HorizontalLayout wrapper = new HorizontalLayout(bubble);
+                wrapper.setWidthFull();
+                    boolean isMyOwnMessage = instanceIpAddress.equals(message.getIpSender());
+                wrapper.setJustifyContentMode(
+                        isMyOwnMessage ? JustifyContentMode.END : JustifyContentMode.START
+                );
+                chatContainer.add(wrapper);
+                chatContainer.getElement().executeJs(
+                        "const el = this; el.scrollTop = el.scrollHeight;"
+                );
+            }
+            });
+            maxIdReceivedMessage = message.getId();
+        } else {
+            System.out.println("UI IS NULL or detached");
+            Broadcaster.unregister(this);
+        }
+    }
+
+
+    private void loadChatHistory() {
+        List<OneMessage> messagesToPublish = ChatServer.getAllChatMessagesAfterId(maxIdReceivedMessage);
+        messagesToPublish.forEach(message -> {
+            if (!message.getMessage().isEmpty()
+                   // && !isKCommand
+            ) {
+                Div bubble = MessageUtils.createDivForMessage(message);
+                HorizontalLayout wrapper = new HorizontalLayout(bubble);
+                wrapper.setWidthFull();
+                boolean isMyOwnMessage = instanceIpAddress.equals(message.getIpSender());
+                wrapper.setJustifyContentMode(
+                        isMyOwnMessage ? JustifyContentMode.END : JustifyContentMode.START
+                );
+                chatContainer.add(wrapper);
+            }
+        });
+        //populate where I left off
+        if(messagesToPublish.size() > 0){
+            maxIdReceivedMessage = messagesToPublish.get(messagesToPublish.size() - 1).getId();
+        }
+    }
+
+    public boolean isKCommand(String messageCommand) {
+        return Arrays.stream(KCommand.values()).anyMatch(entry -> entry.name().equalsIgnoreCase(messageCommand));
+    }
+
+    private void processKeject(){
+        UI.getCurrent().navigate(LandingPage.class);
+    }
+
+    private void processKHide(){
+        if(chatContainer.isVisible() == false){
+            chatContainer.setVisible(true);
+        }else {
+            chatContainer.setVisible(false);
+        }
+    }
+
+    private void processKGarble(){
+
+        boolean garbleActive = (boolean) VaadinSession.getCurrent().getAttribute(KCommand.KGARBLE.name());
+        garbleActive = !garbleActive;
+
+        System.out.println("Garble is now: " + garbleActive);
+        VaadinSession.getCurrent().setAttribute(KCommand.KGARBLE.name(), garbleActive);
+        UI.getCurrent().getPage().reload();
+
+        //another way
+//        UI.getCurrent().navigate(""); // or another temporary route
+//        UI.getCurrent().navigate(MainChatView.class);
+    }
+
+
+    @PreDestroy
+    public void destroy() {
+        Broadcaster.unregister(this);
+        MessageColors storedValue = (MessageColors) VaadinSession.getCurrent().getAttribute(MessageColors.class.getName());
+        if(storedValue.assigned){
+            storedValue.assigned = false;
+        }
+    }
 }
 
